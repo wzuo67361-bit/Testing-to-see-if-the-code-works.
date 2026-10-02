@@ -1,17 +1,11 @@
-import os
 import io
 import gc
 import logging
-import traceback
 import numpy as np
 import pandas as pd
 import streamlit as st
 from PIL import Image, ImageEnhance
-from paddleocr import PaddleOCR
-
-# 屏蔽日志
-logging.getLogger("ppocr").setLevel(logging.ERROR)
-logging.getLogger("paddlex").setLevel(logging.ERROR)
+from rapidocr_onnxruntime import RapidOCR
 
 st.set_page_config(page_title="二手报价单极速工作台", page_icon="📱", layout="wide")
 
@@ -23,38 +17,19 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# 限制缓存条目，防止模型反复加载吃光内存
-@st.cache_resource(show_spinner="正在加载云端高精度 OCR 引擎...", max_entries=1)
-def load_ocr_model():
-    return PaddleOCR(
-        use_angle_cls=True, 
-        lang="ch", 
-        det_limit_side_len=2048, # 从 4096 降至 2048，大幅节省显存/内存
-        use_gpu=False,         
-        enable_mkldnn=False    
-    )
+# 加载 ONNX 轻量化引擎，内存占用仅 ~150MB
+@st.cache_resource(show_spinner="正在加载 ONNX 超轻量高精度引擎...")
+def load_ocr_engine():
+    return RapidOCR()
 
 def enhance_image(img):
     img_gray = img.convert('L')
     return ImageEnhance.Sharpness(ImageEnhance.Contrast(img_gray).enhance(2.0)).enhance(2.0).convert('RGB')
 
-# 【新增】智能缩放算法：限制超大图宽度，防止撑爆 1GB 内存
-def resize_if_too_large(img, max_width=1200):
+def process_dynamic_columns(engine, img, y_tolerance, x_tolerance):
     w, h = img.size
-    if w > max_width:
-        ratio = max_width / w
-        new_h = int(h * ratio)
-        return img.resize((max_width, new_h), Image.Resampling.LANCZOS)
-    return img
-
-def process_dynamic_columns(ocr_model, img, y_tolerance, x_tolerance):
-    # 限制图片尺寸
-    img = resize_if_too_large(img)
-    w, h = img.size
-    
-    # 【修改】缩小切片高度，降低单次推理的内存峰值
-    slice_height = 1200   
-    overlap = 80          
+    slice_height = 1800   
+    overlap = 100          
     
     y_starts = list(range(0, h, slice_height - overlap))
     total_slices = len(y_starts)
@@ -66,25 +41,22 @@ def process_dynamic_columns(ocr_model, img, y_tolerance, x_tolerance):
         y_end = min(y_start + slice_height, h)
         if y_start >= h: break
         
-        progress_bar.progress((i) / total_slices, text=f"🔍 正在扫描切片 ({i+1}/{total_slices})，已开启内存保护...")
+        progress_bar.progress((i) / total_slices, text=f"🔍 正在切片扫描 ({i+1}/{total_slices})...")
         
         slice_img = img.crop((0, y_start, w, y_end))
         img_array = np.array(enhance_image(slice_img))
         
-        raw_result = ocr_model.ocr(img_array, cls=True)
+        # ONNX 引擎推理
+        result, _ = engine(img_array)
         
-        if raw_result:
-            for res in raw_result:
-                if res is None: continue
-                for line in res:
-                    if len(line) >= 2:
-                        box, text = line[0], line[1][0]
-                        cx = sum([p[0] for p in box]) / 4
-                        cy = sum([p[1] for p in box]) / 4 + y_start 
-                        boxes_texts.append({'text': str(text).strip(), 'x': cx, 'y': cy})
+        if result:
+            for line in result:
+                box, text = line[0], line[1]
+                cx = sum([p[0] for p in box]) / 4
+                cy = sum([p[1] for p in box]) / 4 + y_start 
+                boxes_texts.append({'text': str(text).strip(), 'x': cx, 'y': cy})
         
-        # 极限垃圾回收
-        del slice_img, img_array, raw_result
+        del slice_img, img_array, result
         gc.collect() 
 
     progress_bar.progress(0.9, text="✨ 扫描完毕，正在重建动态表格...")
@@ -142,7 +114,7 @@ def process_dynamic_columns(ocr_model, img, y_tolerance, x_tolerance):
     progress_bar.progress(1.0, text="✅ 动态表格重建完成！")
     return df
 
-st.markdown("### 📱 报价单精准提取工作台 `云端极速内存优化版`")
+st.markdown("### 📱 报价单精准提取工作台 `ONNX 极致防爆内存版`")
 
 uploaded_file = st.file_uploader("📂 上传报价单图片 (支持高度几千像素的极限长图)", type=['png', 'jpg', 'jpeg'])
 
@@ -161,8 +133,8 @@ if uploaded_file is not None:
 
     if start_button:
         try:
-            ocr = load_ocr_model()
-            raw_df = process_dynamic_columns(ocr, original_image, y_tol, x_tol)
+            engine = load_ocr_engine()
+            raw_df = process_dynamic_columns(engine, original_image, y_tol, x_tol)
             
             raw_df = raw_df.fillna("").astype(str)
             raw_df.columns = [str(c) for c in raw_df.columns]
@@ -171,8 +143,7 @@ if uploaded_file is not None:
             st.success(f"✅ 成功！自动识别出 {len(raw_df.columns)} 列，共 {raw_df.shape[0]} 行数据。")
         except Exception as e:
             st.error(f"❌ 识别过程中出现错误：{str(e)}")
-            st.code(traceback.format_exc())
-            
+
     if 'ocr_df' in st.session_state and not st.session_state['ocr_df'].empty:
         df = st.session_state['ocr_df']
         
@@ -194,8 +165,4 @@ if uploaded_file is not None:
         st.markdown("---")
         st.markdown("##### 🔍 网页预览（支持左右横向滚动）")
         
-        try:
-            st.dataframe(df, use_container_width=True, height=500)
-        except Exception:
-            st.warning("⚠️ 前端原生表格渲染受限，已自动切换为标准 HTML 展示：")
-            st.write(df.to_html(escape=False), unsafe_allow_html=True)
+        st.dataframe(df, use_container_width=True, height=500)
