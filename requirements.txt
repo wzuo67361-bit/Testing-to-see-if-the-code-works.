@@ -1,0 +1,7 @@
+streamlit
+paddleocr==2.7.3
+paddlepaddle==2.6.2
+numpy==1.26.4
+pandas
+Pillow
+openpyxl
